@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { useCommandStore, pathMetrics } from '@/store/command'
+import { useCommandStore, pathMetrics, dispatchRemaining } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
 import { pointInPolygon, pathBlocked, firstBlocker, detourPathMulti } from '@/utils/geo'
 
@@ -158,7 +158,8 @@ export const useRoadblockStore = defineStore('roadblock', {
       const tr = this._tr()
       const impacts = []
       cmd.dispatches.forEach((d) => {
-        if (d.status === 'held') return
+        // 已办结（全部签收/退回/核销）与挂起（物资在库）的记录不再受阻断影响
+        if (d.status !== 'enroute') return
         const base = cmd.bases.find((b) => b.id === d.baseId)
         if (!base) return
         const pts = [[base.lng, base.lat], ...(d.via || []), [d.lng, d.lat]]
@@ -168,7 +169,7 @@ export const useRoadblockStore = defineStore('roadblock', {
           impacts.push({
             key: d.id, kind: 'dispatch', id: d.id, checked: true,
             destInside: destIn, originInside: originIn,
-            label: `${d.typeLabel} ${d.qty}${d.unit}｜${d.baseName} → ${d.eventTitle || d.shelterName}`,
+            label: `${d.typeLabel} ${dispatchRemaining(d)}${d.unit}｜${d.baseName} → ${d.eventTitle || d.shelterName}`,
             done: false, plan: null, options: [], result: null
           })
         }
@@ -317,9 +318,9 @@ export const useRoadblockStore = defineStore('roadblock', {
               })
             }
           }
-          // 改派基地：库存足够、新路线不穿越任何生效阻断（出发地在区内时靠换基地撤出）
+          // 改派基地：库存足够（按剩余在途量）、新路线不穿越任何生效阻断（出发地在区内时靠换基地撤出）
           const alt = cmd.bases
-            .filter((b) => b.id !== d.baseId && (b.stock[d.type] || 0) >= d.qty)
+            .filter((b) => b.id !== d.baseId && (b.stock[d.type] || 0) >= dispatchRemaining(d))
             .filter((b) => firstBlocker([[b.lng, b.lat], st.z], polys) < 0)
             .map((b) => ({ b, m: pathMetrics([[b.lng, b.lat], st.z]) }))
             .sort((x, y) => x.m.minutes - y.m.minutes)[0]
@@ -513,7 +514,7 @@ export const useRoadblockStore = defineStore('roadblock', {
 
       // 所有绕行中的路线都在剩余阻断视角下联合重算：能回直则回直，仍需绕行则重排
       cmd.dispatches.forEach((d) => {
-        if (d.status === 'held' || !d.detourBy || !(d.via || []).length) return
+        if (d.status !== 'enroute' || !d.detourBy || !(d.via || []).length) return
         const base = cmd.bases.find((b) => b.id === d.baseId)
         if (!base) return
         const a = [base.lng, base.lat], z = [d.lng, d.lat]

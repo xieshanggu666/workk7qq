@@ -18,11 +18,14 @@
     <!-- 当前选中事件 -->
     <div v-if="selectedEvent" class="current-ev">
       <strong>{{ selectedEvent.title }}</strong>
-      <p>🧑‍🚒 所需资源清单（已派 / 需求）</p>
+      <p>🧑‍🚒 所需资源清单（实收+在途 / 需求）</p>
       <div class="demand-row" v-for="(qty, type) in selectedEvent.demand" :key="type">
         <span class="d-label">{{ resLabel(type) }} {{ resIcon(type) }}</span>
-        <div class="d-bar"><i :style="{ width: fillPct(type) }"></i></div>
-        <span class="d-qty">{{ sentOf(type) }}/{{ qty }}{{ resUnit(type) }}</span>
+        <div class="d-bar">
+          <i class="recv" :style="{ width: recvPct(type) }"></i>
+          <i class="transit" :style="{ width: transitPct(type) }"></i>
+        </div>
+        <span class="d-qty">{{ recvOf(type) }}<em v-if="transitOf(type)">+{{ transitOf(type) }}</em>/{{ qty }}{{ resUnit(type) }}</span>
       </div>
     </div>
     <div v-else class="placeholder">← 在地图上或左侧选择一个事件进行调度</div>
@@ -74,20 +77,72 @@
 
     <!-- 派发记录 -->
     <div class="dispatches">
-      <div class="panel-sub">🚚 在途派发记录</div>
+      <div class="panel-sub">🚚 派发记录<em v-if="enrouteCount" class="sub-tag">在途 {{ enrouteCount }} 单待签收</em></div>
       <div v-if="store.dispatches.length === 0" class="tiny-empty">暂无派发</div>
-      <div v-for="d in store.dispatches" :key="d.id" class="dispatch-item" :class="{ held: d.status === 'held' }">
+      <div v-for="d in store.dispatches" :key="d.id" class="dispatch-item"
+           :class="{ held: d.status === 'held', done: d.status === 'done' }">
         <div class="di-head">
           <span class="di-dot" :style="{ background: d.color }"></span>
           <strong>{{ d.typeLabel }}</strong>
           <span v-if="d.status === 'held'" class="di-held">⏸ 挂起</span>
-          <span v-else-if="d.via && d.via.length" class="di-detour">🔀 绕行</span>
+          <span v-else-if="d.status === 'done'" class="di-done-tag">✅ 办结</span>
+          <span v-else-if="d.received" class="di-partial">📦 签收中</span>
+          <span v-if="d.via && d.via.length && d.status === 'enroute'" class="di-detour">🔀 绕行</span>
           <span v-if="d.source" class="di-src" :class="{ plan: d.source === '统筹' }">{{ d.source }}</span>
           <span class="di-qty">{{ d.qty }}{{ d.unit }}</span>
         </div>
         <p class="di-sub">{{ d.baseName }} → {{ d.eventTitle || d.shelterName }}</p>
         <p class="di-meta">{{ d.at }} · {{ d.distance }}km · 约{{ d.minutes }}min</p>
-        <button class="undo" @click="store.withdrawDispatch(d.id)">撤回</button>
+        <!-- 在途 / 实收 / 退回 / 短缺 分别核算 -->
+        <p class="di-nums">
+          <span class="nn recv">实收 {{ d.received || 0 }}</span>
+          <span v-if="d.status === 'enroute'" class="nn transit">在途 {{ remainingOf(d) }}</span>
+          <span v-else-if="d.status === 'held'" class="nn held-qty">在库 {{ remainingOf(d) }}（挂起退回）</span>
+          <span v-if="d.returned" class="nn back">退回 {{ d.returned }}</span>
+          <span v-if="d.shortage" class="nn short">短缺 {{ d.shortage }}</span>
+        </p>
+        <p v-if="d.receipts && d.receipts.length" class="di-receipts">
+          ✓ 签收 {{ d.receipts.length }} 次：{{ d.receipts.map((r) => r.qty).join(' + ') }}
+        </p>
+        <!-- 闭环操作：在途可签收/退回/补派；撤回仅退剩余在途 -->
+        <div class="di-ops">
+          <template v-if="d.status === 'enroute'">
+            <button @click="openOp(d, 'sign')">📦 签收</button>
+            <button @click="openOp(d, 'return')">↩️ 退回</button>
+            <button @click="openOp(d, 'resupply')">🧩 补派</button>
+          </template>
+          <button class="danger" @click="store.withdrawDispatch(d.id)">撤回</button>
+        </div>
+        <!-- 签收 / 退回 / 补派面板 -->
+        <div v-if="opId === d.id && d.status === 'enroute'" class="di-panel">
+          <template v-if="opMode === 'sign'">
+            <label>📦 签收数量（剩余在途 {{ remainingOf(d) }}{{ d.unit }}）</label>
+            <div class="op-row">
+              <input type="number" min="1" :max="remainingOf(d)" v-model.number="opQty" />
+              <button class="ok" @click="confirmOp(d)">确认签收</button>
+            </div>
+          </template>
+          <template v-else-if="opMode === 'return'">
+            <label>↩️ 退回数量（物资回库至 {{ d.baseName }}）</label>
+            <div class="op-row">
+              <input type="number" min="1" :max="remainingOf(d)" v-model.number="opQty" />
+              <button class="ok" @click="confirmOp(d)">确认退回</button>
+            </div>
+          </template>
+          <template v-else>
+            <label>🧩 短缺补派（核销原单短缺，就近补出差额）</label>
+            <select v-model="opBaseId">
+              <option v-for="b in store.bases" :key="b.id" :value="b.id">
+                {{ b.name }}（余 {{ b.stock[d.type] || 0 }}）
+              </option>
+            </select>
+            <div class="op-row">
+              <input type="number" min="1" :max="remainingOf(d)" v-model.number="opQty" />
+              <button class="ok" @click="confirmOp(d)">确认补派</button>
+            </div>
+          </template>
+          <p v-if="opMsg" class="op-err">{{ opMsg }}</p>
+        </div>
       </div>
     </div>
     </template>

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { useCommandStore, roughPath, pathMetrics } from '@/store/command'
+import { useCommandStore, roughPath, pathMetrics, dispatchRemaining } from '@/store/command'
 import { useRoadblockStore } from '@/store/roadblock'
 import { SHELTERS, SUPPLY_PER_CAPITA } from '@/mock/data'
 
@@ -36,6 +36,7 @@ export const useTransferStore = defineStore('transfer', {
       return m
     },
     /* ---------- 安置点物资需求（在住人数 × 人均系数 - 已补给） ---------- */
+    // 已补给 = 在途剩余 + 实收（挂起记录物资已回库不计入；退回/短缺部分自动释放缺口）
     shelterNeeds(state) {
       const cmd = useCommandStore()
       return state.shelters.map((s) => {
@@ -44,7 +45,8 @@ export const useTransferStore = defineStore('transfer', {
         Object.entries(SUPPLY_PER_CAPITA).forEach(([t, coef]) => { need[t] = Math.ceil(occ * coef) })
         const sent = {}
         cmd.dispatches.forEach((d) => {
-          if (d.shelterId === s.id) sent[d.type] = (sent[d.type] || 0) + d.qty
+          if (d.shelterId !== s.id || d.status === 'held') return
+          sent[d.type] = (sent[d.type] || 0) + (d.received || 0) + (d.status === 'done' ? 0 : dispatchRemaining(d))
         })
         const gap = {}
         Object.entries(need).forEach(([t, n]) => {

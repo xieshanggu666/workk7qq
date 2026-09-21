@@ -15,6 +15,20 @@ function notifyDispatchChanged() {
 // 灾情等级权重（统筹分配优先级：等级高者优先锁定库存）
 const SEV_WEIGHT = { red: 4, orange: 3, yellow: 2, blue: 1 }
 
+// 派发记录归一化：兼容无签收字段的旧记录（实收/退回/短缺/签收流水缺省为零值）
+export function normalizeDispatch(d) {
+  if (d.received == null) d.received = 0
+  if (d.returned == null) d.returned = 0
+  if (d.shortage == null) d.shortage = 0
+  if (!Array.isArray(d.receipts)) d.receipts = []
+  return d
+}
+
+// 剩余在途量 = 派发量 - 实收 - 退回入库 - 短缺核销（兼容旧记录缺省字段）
+export function dispatchRemaining(d) {
+  return Math.max(0, d.qty - (d.received || 0) - (d.returned || 0) - (d.shortage || 0))
+}
+
 // 折线路径估算里程与时长（直线 x 路网系数，演示用）
 export function pathMetrics(points) {
   const roadDist = Math.round(pathKm(points) * 1.25 * 10) / 10 // 路网折算
@@ -60,17 +74,31 @@ export const useCommandStore = defineStore('command', {
       if (state.search) list = list.filter((e) => e.title.includes(state.search) || (e.location && e.location.name.includes(state.search)))
       return list
     },
-    // 各事件在途已满足量：eventId -> { type: qty }（安置点补给记录无 eventId、挂起任务未出库，均跳过）
+    // 各事件已满足量（在途+实收合计）：eventId -> { type: qty }
+    //（安置点补给记录无 eventId、挂起任务物资已回库，均不计入；退回/短缺部分自动释放缺口）
     sentMap(state) {
       const m = {}
       state.dispatches.forEach((d) => {
         if (!d.eventId || d.status === 'held') return
         m[d.eventId] = m[d.eventId] || {}
-        m[d.eventId][d.type] = (m[d.eventId][d.type] || 0) + d.qty
+        const settled = (d.received || 0) + (d.status === 'done' ? 0 : dispatchRemaining(d))
+        m[d.eventId][d.type] = (m[d.eventId][d.type] || 0) + settled
       })
       return m
     },
-    // 各事件需求缺口：需求 - 在途 - 方案预占
+    // 在途与实收分别核算：eventId -> { type: { inTransit, received } }
+    sentDetail(state) {
+      const m = {}
+      state.dispatches.forEach((d) => {
+        if (!d.eventId || d.status === 'held') return
+        const t = (m[d.eventId] = m[d.eventId] || {})
+        const slot = (t[d.type] = t[d.type] || { inTransit: 0, received: 0 })
+        slot.received += d.received || 0
+        if (d.status !== 'done') slot.inTransit += dispatchRemaining(d)
+      })
+      return m
+    },
+    // 各事件需求缺口：需求 - 在途/实收 - 方案预占
     gaps(state) {
       const planned = {}
       state.plan.forEach((p) => {
@@ -162,7 +190,9 @@ export const useCommandStore = defineStore('command', {
         distance: path.distance, minutes: path.minutes, at: nowStr(),
         color: EVENT_TYPES[ev.type].color, source,
         // 道路阻断处置：在途/挂起状态、绕行途经点、来源阻断
-        status: 'enroute', via: [], detourBy: null, holdBy: null
+        status: 'enroute', via: [], detourBy: null, holdBy: null,
+        // 派发闭环：实收 / 退回入库 / 短缺核销 / 签收流水（分批签收可追溯）
+        received: 0, returned: 0, shortage: 0, receipts: []
       }
       this.dispatches.unshift(record)
       ev.timeline.push({ at: record.at, text: `${source}派发 ${record.typeLabel} ${qty}${record.unit}👈${base.name}` })
@@ -193,17 +223,19 @@ export const useCommandStore = defineStore('command', {
         type, typeLabel: RESOURCE_TYPES[type].label, qty, unit: RESOURCE_TYPES[type].unit,
         distance: path.distance, minutes: path.minutes, at: nowStr(),
         color: '#26a69a', source: '安置补给',
-        status: 'enroute', via: [], detourBy: null, holdBy: null
+        status: 'enroute', via: [], detourBy: null, holdBy: null,
+        // 派发闭环：实收 / 退回入库 / 短缺核销 / 签收流水
+        received: 0, returned: 0, shortage: 0, receipts: []
       }
       this.dispatches.unshift(record)
       notifyDispatchChanged()
       return record
     },
-    /* ---------- 道路阻断处置：改道 / 改派 / 挂起 / 续派 ---------- */
+    /* ---------- 道路阻断处置：改道 / 改派 / 挂起 / 续派（数量均按剩余在途核算） ---------- */
     // 绕行改道：写入途经点并重算里程与到达时间（地图路线联动更新）
     rerouteDispatch(id, via, blockId = null, silent = false) {
       const rec = this.dispatches.find((d) => d.id === id)
-      if (!rec || rec.status === 'held') return null
+      if (!rec || rec.status !== 'enroute') return null
       const base = this.bases.find((b) => b.id === rec.baseId)
       if (!base) return null
       const m = pathMetrics([[base.lng, base.lat], ...via, [rec.lng, rec.lat]])
@@ -212,18 +244,19 @@ export const useCommandStore = defineStore('command', {
       rec.minutes = m.minutes
       rec.detourBy = blockId
       const ev = this.events.find((e) => e.id === rec.eventId)
-      if (ev && !silent) ev.timeline.push({ at: nowStr(), text: `🔀 派发绕行改道：${rec.typeLabel} ${rec.qty}${rec.unit}，约 ${m.distance}km·${m.minutes}min` })
+      if (ev && !silent) ev.timeline.push({ at: nowStr(), text: `🔀 派发绕行改道：${rec.typeLabel} ${dispatchRemaining(rec)}${rec.unit}，约 ${m.distance}km·${m.minutes}min` })
       return rec
     },
-    // 改派出货基地：退回旧基地库存、新基地扣减，路线与 ETA 重算
+    // 改派出货基地：剩余在途量退回旧基地、新基地扣减，路线与 ETA 重算
     reassignDispatch(id, newBaseId) {
       const rec = this.dispatches.find((d) => d.id === id)
       const nb = this.bases.find((b) => b.id === newBaseId)
-      if (!rec || !nb || rec.status === 'held' || rec.baseId === newBaseId) return null
-      if ((nb.stock[rec.type] || 0) < rec.qty) return null
+      if (!rec || !nb || rec.status !== 'enroute' || rec.baseId === newBaseId) return null
+      const rem = dispatchRemaining(rec)
+      if ((nb.stock[rec.type] || 0) < rem) return null
       const ob = this.bases.find((b) => b.id === rec.baseId)
-      if (ob) ob.stock[rec.type] = (ob.stock[rec.type] || 0) + rec.qty
-      nb.stock[rec.type] -= rec.qty
+      if (ob) ob.stock[rec.type] = (ob.stock[rec.type] || 0) + rem
+      nb.stock[rec.type] -= rem
       rec.baseId = nb.id
       rec.baseName = nb.name
       rec.via = []
@@ -233,32 +266,34 @@ export const useCommandStore = defineStore('command', {
       rec.minutes = m.minutes
       rec.source = '改派'
       const ev = this.events.find((e) => e.id === rec.eventId)
-      if (ev) ev.timeline.push({ at: nowStr(), text: `🔀 派发改派：${rec.typeLabel} ${rec.qty}${rec.unit} 改由 ${nb.name} 出库` })
+      if (ev) ev.timeline.push({ at: nowStr(), text: `🔀 派发改派：${rec.typeLabel} ${rem}${rec.unit} 改由 ${nb.name} 出库` })
       return rec
     },
-    // 挂起：物资退回基地、不计入已满足量，待恢复通行后续派
+    // 挂起：剩余在途物资退回基地、不计入已满足量（已签收部分不退），待恢复通行后续派
     holdDispatch(id, blockId) {
       const rec = this.dispatches.find((d) => d.id === id)
-      if (!rec || rec.status === 'held') return null
+      if (!rec || rec.status !== 'enroute') return null
+      const rem = dispatchRemaining(rec)
       const base = this.bases.find((b) => b.id === rec.baseId)
-      if (base) base.stock[rec.type] = (base.stock[rec.type] || 0) + rec.qty
+      if (base) base.stock[rec.type] = (base.stock[rec.type] || 0) + rem
       rec.status = 'held'
       rec.holdBy = blockId
       rec.via = []
       rec.detourBy = null
       const ev = this.events.find((e) => e.id === rec.eventId)
-      if (ev) ev.timeline.push({ at: nowStr(), text: `⏸ 派发挂起：${rec.typeLabel} ${rec.qty}${rec.unit} 因道路阻断退回 ${rec.baseName}，待恢复通行后续派` })
+      if (ev) ev.timeline.push({ at: nowStr(), text: `⏸ 派发挂起：${rec.typeLabel} 剩余在途 ${rem}${rec.unit} 因道路阻断退回 ${rec.baseName}，待恢复通行后续派` })
       return rec
     },
-    // 续派：复核库存后重新出库，重置路线与出发时间
+    // 续派：复核库存后剩余在途量重新出库，重置路线与出发时间
     resumeDispatch(id) {
       const rec = this.dispatches.find((d) => d.id === id)
       if (!rec || rec.status !== 'held') return { ok: false, msg: '记录不存在或未挂起' }
+      const rem = dispatchRemaining(rec)
       const base = this.bases.find((b) => b.id === rec.baseId)
-      if (!base || (base.stock[rec.type] || 0) < rec.qty) {
+      if (!base || (base.stock[rec.type] || 0) < rem) {
         return { ok: false, msg: `${base?.name || rec.baseName} 库存不足，无法续派` }
       }
-      base.stock[rec.type] -= rec.qty
+      base.stock[rec.type] -= rem
       rec.status = 'enroute'
       rec.holdBy = null
       rec.via = []
@@ -268,13 +303,13 @@ export const useCommandStore = defineStore('command', {
       rec.minutes = m.minutes
       rec.at = nowStr()
       const ev = this.events.find((e) => e.id === rec.eventId)
-      if (ev) ev.timeline.push({ at: nowStr(), text: `▶️ 恢复续派：${rec.typeLabel} ${rec.qty}${rec.unit} 重新出库，约 ${m.distance}km·${m.minutes}min` })
+      if (ev) ev.timeline.push({ at: nowStr(), text: `▶️ 恢复续派：${rec.typeLabel} ${rem}${rec.unit} 重新出库，约 ${m.distance}km·${m.minutes}min` })
       return { ok: true }
     },
     // 阻断解除后恢复直线（由道路阻断模块判定不再穿越其它阻断后调用）
     resetDispatchRoute(id) {
       const rec = this.dispatches.find((d) => d.id === id)
-      if (!rec || rec.status === 'held') return
+      if (!rec || rec.status !== 'enroute') return
       const base = this.bases.find((b) => b.id === rec.baseId)
       if (!base) return
       rec.via = []
@@ -283,13 +318,104 @@ export const useCommandStore = defineStore('command', {
       rec.distance = m.distance
       rec.minutes = m.minutes
     },
+
+    /* ---------- 派发闭环：分批签收 / 退回入库 / 短缺补派 ---------- */
+
+    // 分批签收：实收累加并记录签收流水；剩余在途清零时自动办结（超额/重复签收拦截）
+    signDispatch(id, qty) {
+      const rec = this.dispatches.find((d) => d.id === id)
+      if (!rec) return { ok: false, msg: '派发记录不存在' }
+      if (rec.status === 'held') return { ok: false, msg: '派发挂起中，物资已退回基地，待续派后再签收' }
+      if (rec.status !== 'enroute') return { ok: false, msg: '该派发已办结，请勿重复签收' }
+      normalizeDispatch(rec)
+      qty = Math.round(qty)
+      const rem = dispatchRemaining(rec)
+      if (!qty || qty <= 0) return { ok: false, msg: '请填写有效的签收数量' }
+      if (qty > rem) return { ok: false, msg: `签收超量：剩余在途仅 ${rem}${rec.unit}，请勿重复签收` }
+      rec.received += qty
+      rec.receipts.push({ qty, at: nowStr() })
+      const left = dispatchRemaining(rec)
+      if (left === 0) rec.status = 'done'
+      const ev = this.events.find((e) => e.id === rec.eventId)
+      const dest = rec.eventTitle || rec.shelterName
+      if (ev) {
+        ev.timeline.push({
+          at: nowStr(),
+          text: left === 0
+            ? `✅ 签收办结：${rec.typeLabel} ${qty}${rec.unit} 送达${dest}，累计实收 ${rec.received}/${rec.qty}${rec.unit}`
+            : `📦 分批签收：${rec.typeLabel} ${qty}${rec.unit} 送达${dest}（实收 ${rec.received} · 在途 ${left}）`
+        })
+      }
+      return { ok: true, done: left === 0, remaining: left }
+    },
+    // 退回入库：剩余在途部分退回出货基地（库存回加），防重复回库
+    returnDispatch(id, qty) {
+      const rec = this.dispatches.find((d) => d.id === id)
+      if (!rec) return { ok: false, msg: '派发记录不存在' }
+      if (rec.status === 'held') return { ok: false, msg: '派发挂起中，物资已退回基地，无需重复回库' }
+      if (rec.status !== 'enroute') return { ok: false, msg: '该派发已办结，无可退回数量' }
+      normalizeDispatch(rec)
+      qty = Math.round(qty)
+      const rem = dispatchRemaining(rec)
+      if (!qty || qty <= 0) return { ok: false, msg: '请填写有效的退回数量' }
+      if (qty > rem) return { ok: false, msg: `退回超量：剩余在途仅 ${rem}${rec.unit}，请勿重复回库` }
+      const base = this.bases.find((b) => b.id === rec.baseId)
+      if (!base) return { ok: false, msg: '出货基地不存在' }
+      rec.returned += qty
+      base.stock[rec.type] = (base.stock[rec.type] || 0) + qty
+      const left = dispatchRemaining(rec)
+      if (left === 0) rec.status = 'done'
+      const ev = this.events.find((e) => e.id === rec.eventId)
+      if (ev) ev.timeline.push({ at: nowStr(), text: `↩️ 物资退回：${rec.typeLabel} ${qty}${rec.unit} 退回 ${base.name} 入库（剩余在途 ${left}）` })
+      return { ok: true, done: left === 0, remaining: left }
+    },
+    // 短缺补派：核销原单短缺量（缺口重新释放），并从基地补出差额生成关联补派单
+    resupplyDispatch(id, { baseId, qty } = {}) {
+      const rec = this.dispatches.find((d) => d.id === id)
+      if (!rec) return { ok: false, msg: '派发记录不存在' }
+      if (rec.status === 'held') return { ok: false, msg: '派发挂起中，待续派后再处理短缺' }
+      if (rec.status !== 'enroute') return { ok: false, msg: '该派发已办结，无短缺可补' }
+      normalizeDispatch(rec)
+      const rem = dispatchRemaining(rec)
+      qty = qty == null ? rem : Math.round(qty)
+      if (qty <= 0 || qty > rem) return { ok: false, msg: `补派数量无效：剩余在途 ${rem}${rec.unit}` }
+      const base = this.bases.find((b) => b.id === (baseId || rec.baseId))
+      if (!base) return { ok: false, msg: '补派基地不存在' }
+      if ((base.stock[rec.type] || 0) < qty) {
+        return { ok: false, msg: `${base.name} 库存不足（余 ${base.stock[rec.type] || 0}${rec.unit}），无法补派 ${qty}${rec.unit}` }
+      }
+      // 原单核销短缺（缺口释放，由补派单承接）
+      rec.shortage += qty
+      if (dispatchRemaining(rec) === 0) rec.status = 'done'
+      // 生成关联补派单（独立在途，可签收/退回/挂起/阻断处置）
+      let child = null
+      if (rec.eventId) {
+        child = this._pushDispatch(base.id, rec.eventId, rec.type, qty, '补派')
+      } else {
+        child = this.dispatchToShelter({
+          baseId: base.id, shelterId: rec.shelterId, shelterName: rec.shelterName,
+          lng: rec.lng, lat: rec.lat, type: rec.type, qty
+        })
+        if (child) child.source = '补派'
+      }
+      if (!child) { // 兜底：补派失败回滚短缺核销
+        rec.shortage -= qty
+        rec.status = 'enroute'
+        return { ok: false, msg: '补派失败：库存不足' }
+      }
+      child.refillFor = rec.id
+      const ev = this.events.find((e) => e.id === rec.eventId)
+      if (ev) ev.timeline.push({ at: nowStr(), text: `🧩 短缺补派：${rec.typeLabel} 短缺 ${qty}${rec.unit} 已核销，由 ${base.name} 补派出库` })
+      return { ok: true, child, remaining: dispatchRemaining(rec) }
+    },
+
+    // 撤回：仅退回剩余在途量（挂起记录库存已退回、办结记录无剩余，均不重复返还）
     withdrawDispatch(recordId) {
       const rec = this.dispatches.find((d) => d.id === recordId)
       if (!rec) return
-      // 挂起记录库存已退回，撤回时不再重复返还
-      if (rec.status !== 'held') {
+      if (rec.status === 'enroute') {
         const base = this.bases.find((b) => b.id === rec.baseId)
-        if (base) base.stock[rec.type] += rec.qty
+        if (base) base.stock[rec.type] = (base.stock[rec.type] || 0) + dispatchRemaining(rec)
       }
       this.dispatches = this.dispatches.filter((d) => d.id !== recordId)
     },
@@ -432,12 +558,12 @@ export const useCommandStore = defineStore('command', {
     resetResource(eventId) {
       const ev = this.events.find((e) => e.id === eventId)
       if (!ev) return
-      // 撤回该事件关联的所有派发（挂起记录库存已退回，不再重复返还）
+      // 撤回该事件关联的所有派发：仅退回剩余在途量（挂起记录库存已退回、办结记录无剩余，不重复返还）
       this.dispatches = this.dispatches.filter((d) => {
         if (d.eventId !== eventId) return true
-        if (d.status !== 'held') {
+        if (d.status === 'enroute') {
           const base = this.bases.find((b) => b.id === d.baseId)
-          if (base) base.stock[d.type] += d.qty
+          if (base) base.stock[d.type] = (base.stock[d.type] || 0) + dispatchRemaining(d)
         }
         return false
       })
