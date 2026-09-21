@@ -200,7 +200,10 @@
           <span v-else class="need-ok">✅ 物资充足</span>
         </div>
         <p class="sh-sent" v-if="Object.keys(item.sent).length">
-          已补给：<span v-for="(q, t) in item.sent" :key="t">{{ resIcon(t) }}{{ q }}{{ resUnit(t) }} </span>
+          已保障（实收+在途）：<span v-for="(q, t) in item.sent" :key="t">{{ resIcon(t) }}{{ q }}{{ resUnit(t) }} </span>
+        </p>
+        <p class="sh-recv" v-if="Object.keys(item.received).length">
+          📥 实际签收：<span v-for="(q, t) in item.received" :key="t">{{ resIcon(t) }}{{ q }}{{ resUnit(t) }} </span>
         </p>
         <button class="supply-btn" :disabled="!Object.keys(item.gap).length" @click="onSupply(item.shelter.id)">
           📦 一键补给（就近调拨）
@@ -537,6 +540,7 @@ function onSupply(shelterId) {
 }
 .need-ok { font-size: 10px; color: #7ef0c9; }
 .sh-sent { font-size: 10px; color: #8ba2c8; margin: 6px 0 0; }
+.sh-recv { font-size: 10px; color: #7ef0c9; margin: 2px 0 0; }
 .supply-btn {
   width: 100%; margin-top: 8px; padding: 7px; border: none; border-radius: 7px;
   background: linear-gradient(135deg, #0f5e52, #26a69a);

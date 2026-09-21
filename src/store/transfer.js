@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { useCommandStore, roughPath, pathMetrics } from '@/store/command'
+import { useCommandStore, roughPath, pathMetrics, dispatchParts } from '@/store/command'
 import { useRoadblockStore } from '@/store/roadblock'
 import { SHELTERS, SUPPLY_PER_CAPITA } from '@/mock/data'
 
@@ -43,15 +43,20 @@ export const useTransferStore = defineStore('transfer', {
         const need = {}
         Object.entries(SUPPLY_PER_CAPITA).forEach(([t, coef]) => { need[t] = Math.ceil(occ * coef) })
         const sent = {}
+        const received = {}
         cmd.dispatches.forEach((d) => {
-          if (d.shelterId === s.id) sent[d.type] = (sent[d.type] || 0) + d.qty
+          if (d.shelterId !== s.id) return
+          const p = dispatchParts(d)
+          const cover = p.received + p.inTransit
+          if (cover > 0) sent[d.type] = (sent[d.type] || 0) + cover
+          if (p.received > 0) received[d.type] = (received[d.type] || 0) + p.received
         })
         const gap = {}
         Object.entries(need).forEach(([t, n]) => {
           const g = n - (sent[t] || 0)
           if (g > 0) gap[t] = g
         })
-        return { shelter: s, occ, need, sent, gap }
+        return { shelter: s, occ, need, sent, received, gap }
       })
     },
     /* ---------- 事件转移进度（回写事件详情） ---------- */

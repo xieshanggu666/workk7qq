@@ -18,11 +18,15 @@
     <!-- 当前选中事件 -->
     <div v-if="selectedEvent" class="current-ev">
       <strong>{{ selectedEvent.title }}</strong>
-      <p>🧑‍🚒 所需资源清单（已派 / 需求）</p>
+      <p>🧑‍🚒 所需资源清单（保障=实收+在途 / 需求）</p>
       <div class="demand-row" v-for="(qty, type) in selectedEvent.demand" :key="type">
         <span class="d-label">{{ resLabel(type) }} {{ resIcon(type) }}</span>
         <div class="d-bar"><i :style="{ width: fillPct(type) }"></i></div>
-        <span class="d-qty">{{ sentOf(type) }}/{{ qty }}{{ resUnit(type) }}</span>
+        <span class="d-qty">
+          <em>{{ sentOf(type) }}/{{ qty }}{{ resUnit(type) }}</em>
+          <i v-if="receivedOf(type) > 0">📥 实收 {{ receivedOf(type) }}</i>
+          <i v-else-if="shortOf(type) > 0" class="short">⚠ 短缺待补 {{ shortOf(type) }}</i>
+        </span>
       </div>
     </div>
     <div v-else class="placeholder">← 在地图上或左侧选择一个事件进行调度</div>
@@ -72,22 +76,91 @@
       </div>
     </div>
 
-    <!-- 派发记录 -->
+    <!-- 派发记录（闭环：分批签收 / 短缺补派 / 退回入库） -->
     <div class="dispatches">
-      <div class="panel-sub">🚚 在途派发记录</div>
+      <div class="panel-sub">🚚 派发记录（在途 / 实收 / 短缺 / 退回分账）</div>
       <div v-if="store.dispatches.length === 0" class="tiny-empty">暂无派发</div>
-      <div v-for="d in store.dispatches" :key="d.id" class="dispatch-item" :class="{ held: d.status === 'held' }">
+      <div
+        v-for="d in store.dispatches" :key="d.id"
+        class="dispatch-item"
+        :class="{ held: d.status === 'held', done: d.status === 'done' }"
+      >
         <div class="di-head">
           <span class="di-dot" :style="{ background: d.color }"></span>
           <strong>{{ d.typeLabel }}</strong>
           <span v-if="d.status === 'held'" class="di-held">⏸ 挂起</span>
+          <span v-else-if="d.status === 'done'" class="di-done" :class="d.doneReason">
+            {{ d.doneReason === 'returned' ? '↩️ 已退库' : d.doneReason === 'short' ? '⚠ 含短缺办结' : '✅ 已签收' }}
+          </span>
           <span v-else-if="d.via && d.via.length" class="di-detour">🔀 绕行</span>
-          <span v-if="d.source" class="di-src" :class="{ plan: d.source === '统筹' }">{{ d.source }}</span>
-          <span class="di-qty">{{ d.qty }}{{ d.unit }}</span>
+          <span v-if="d.source" class="di-src" :class="{ plan: d.source === '统筹', replenish: (d.source || '').includes('补派') }">{{ d.source }}</span>
+          <span class="di-qty">
+            <em>{{ partsOf(d).received }}/{{ d.qty }}{{ d.unit }}</em>
+            <i v-if="partsOf(d).inTransit > 0" class="q-transit">在途 {{ partsOf(d).inTransit }}</i>
+          </span>
         </div>
         <p class="di-sub">{{ d.baseName }} → {{ d.eventTitle || d.shelterName }}</p>
+        <!-- 数量分账条 -->
+        <div class="di-ledger" :title="`在途${partsOf(d).inTransit} · 实收${partsOf(d).received} · 短缺${partsOf(d).shortage} · 退回${partsOf(d).returned}`">
+          <i class="lg-transit" :style="{ width: pctOf(d, partsOf(d).inTransit) }"></i>
+          <i class="lg-recv" :style="{ width: pctOf(d, partsOf(d).received) }"></i>
+          <i class="lg-short" :style="{ width: pctOf(d, partsOf(d).shortage) }"></i>
+          <i class="lg-ret" :style="{ width: pctOf(d, partsOf(d).returned) }"></i>
+        </div>
+        <p class="di-ledger-txt">
+          🚚 在途 <b>{{ partsOf(d).inTransit }}</b> · 📥 实收 <b>{{ partsOf(d).received }}</b>
+          <template v-if="partsOf(d).shortage">· ⚠ 短缺 <b>{{ partsOf(d).shortage }}</b>
+            <em v-if="partsOf(d).resupplied">（已补 {{ partsOf(d).resupplied }}）</em>
+          </template>
+          <template v-if="partsOf(d).returned">· ↩️ 退回 <b>{{ partsOf(d).returned }}</b></template>
+          {{ d.unit }}
+        </p>
         <p class="di-meta">{{ d.at }} · {{ d.distance }}km · 约{{ d.minutes }}min</p>
-        <button class="undo" @click="store.withdrawDispatch(d.id)">撤回</button>
+
+        <!-- 闭环操作（仅在途记录） -->
+        <div v-if="d.status === 'enroute'" class="di-actions">
+          <button class="act sign" @click="openForm(d.id, 'sign')">📥 签收</button>
+          <button class="act ret" @click="openForm(d.id, 'return')">↩️ 退回</button>
+          <button
+            v-if="partsOf(d).shortPending > 0"
+            class="act replenish"
+            @click="onReplenish(d)"
+          >🔁 短缺补派 {{ partsOf(d).shortPending }}{{ d.unit }}</button>
+          <button class="act withdraw" @click="store.withdrawDispatch(d.id)">撤回</button>
+        </div>
+
+        <!-- 签收表单：分批签收 + 本次可同时认定短缺 -->
+        <div v-if="formOf[d.id]?.mode === 'sign'" class="mini-form">
+          <p class="mf-hint">本次签收（在途余量 {{ partsOf(d).inTransit }}{{ d.unit }}，可分多批）</p>
+          <div class="mf-row">
+            <input type="number" min="0" :max="partsOf(d).inTransit" v-model.number="formOf[d.id].qty" placeholder="签收数" />
+            <input type="number" min="0" :max="partsOf(d).inTransit" v-model.number="formOf[d.id].shortQty" placeholder="短缺数（可空）" />
+            <input v-model="formOf[d.id].receiver" placeholder="签收人（可空）" />
+          </div>
+          <div class="mf-btns">
+            <button class="ok" @click="onSign(d)">确认签收</button>
+            <button @click="clearForm(d.id)">取消</button>
+          </div>
+        </div>
+        <!-- 退回表单 -->
+        <div v-else-if="formOf[d.id]?.mode === 'return'" class="mini-form">
+          <p class="mf-hint">退回入库（在途余量 {{ partsOf(d).inTransit }}{{ d.unit }}，退回后库存回补）</p>
+          <div class="mf-row">
+            <input type="number" min="0" :max="partsOf(d).inTransit" v-model.number="formOf[d.id].qty" placeholder="退回数" />
+            <input v-model="formOf[d.id].reason" placeholder="退回原因（可空）" />
+          </div>
+          <div class="mf-btns">
+            <button class="warn" @click="onReturn(d)">确认退回</button>
+            <button @click="clearForm(d.id)">取消</button>
+          </div>
+        </div>
+
+        <p v-if="fb[d.id]" class="di-fb" :class="fb[d.id].ok ? 'ok' : 'err'">{{ fb[d.id].msg }}</p>
+        <!-- 最近签收回执 -->
+        <p v-if="d.signLogs && d.signLogs.length" class="di-signlog">
+          最近签收：{{ d.signLogs[d.signLogs.length - 1].at }}
+          {{ d.signLogs[d.signLogs.length - 1].qty }}{{ d.unit }} · {{ d.signLogs[d.signLogs.length - 1].receiver }}
+        </p>
       </div>
     </div>
     </template>
@@ -104,8 +177,8 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue'
-import { useCommandStore } from '@/store/command'
+import { ref, computed, reactive, watch } from 'vue'
+import { useCommandStore, dispatchParts } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
 import { useRoadblockStore } from '@/store/roadblock'
 import { RESOURCE_TYPES } from '@/mock/data'
@@ -141,15 +214,68 @@ const formQtyLabel = computed(() => {
   return `${qty}${resUnit(form.value.type)}`
 })
 
-// 事件需求条：在途已满足量与满足率
+// 事件需求条：在途保障量（实收+在途）与满足率
 const sentOf = (type) => {
   if (!selectedEvent.value) return 0
   return store.sentMap[selectedEvent.value.id]?.[type] || 0
+}
+// 实际签收量（闭环实收口径）
+const receivedOf = (type) => {
+  if (!selectedEvent.value) return 0
+  return store.receivedMap[selectedEvent.value.id]?.[type] || 0
+}
+// 已认定未补派的短缺量
+const shortOf = (type) => {
+  if (!selectedEvent.value) return 0
+  return store.shortageMap[selectedEvent.value.id]?.[type] || 0
 }
 function fillPct(type) {
   const need = selectedEvent.value?.demand?.[type] || 0
   if (!need) return '0%'
   return Math.min(100, Math.round((sentOf(type) / need) * 100)) + '%'
+}
+
+/* ---------- 派发闭环：签收 / 短缺补派 / 退回入库 ---------- */
+// 各记录行内表单：{ [id]: { mode: 'sign'|'return', qty, shortQty, receiver, reason } }
+const formOf = reactive({})
+const fb = reactive({})
+const partsOf = (d) => dispatchParts(d)
+const pctOf = (d, v) => Math.min(100, Math.round((v / d.qty) * 100)) + '%'
+
+function openForm(id, mode) {
+  const p = store.dispatches.find((d) => d.id === id)
+  if (!p) return
+  formOf[id] = { mode, qty: dispatchParts(p).inTransit, shortQty: 0, receiver: '', reason: '' }
+  delete fb[id]
+}
+function clearForm(id) { delete formOf[id] }
+
+function onSign(d) {
+  const f = formOf[d.id]
+  const r = store.signDispatch(d.id, { qty: f.qty, shortQty: f.shortQty, receiver: f.receiver })
+  fb[d.id] = r.ok
+    ? {
+        ok: true,
+        msg: `签收成功，累计实收 ${r.received}/${d.qty}${d.unit}`
+          + (r.shortage ? `，短缺 ${r.shortage}${d.unit}` : '')
+          + (r.outstanding > 0 ? `，在途余量 ${r.outstanding}${d.unit}` : '，已办结')
+      }
+    : { ok: false, msg: r.msg }
+  if (r.ok) clearForm(d.id)
+}
+function onReturn(d) {
+  const f = formOf[d.id]
+  const r = store.returnDispatch(d.id, { qty: f.qty, reason: f.reason })
+  fb[d.id] = r.ok
+    ? { ok: true, msg: `已退回入库 ${f.qty}${d.unit}，库存已回补` + (r.outstanding > 0 ? `，在途余量 ${r.outstanding}${d.unit}` : '，已办结') }
+    : { ok: false, msg: r.msg }
+  if (r.ok) clearForm(d.id)
+}
+function onReplenish(d) {
+  const r = store.replenishShortage(d.id)
+  fb[d.id] = r.ok
+    ? { ok: true, msg: `短缺补派 ${r.sent.length} 单共 ${r.sent.reduce((s, x) => s + x.qty, 0)}${d.unit} 已出库` + (r.unmet ? `，仍缺 ${r.unmet}${d.unit}` : '') }
+    : { ok: false, msg: r.msg }
 }
 
 function onDispatch() {
@@ -220,7 +346,10 @@ watch(selectedEvent, (ev) => {
 .d-label { width: 78px; color: #aebadd; flex-shrink: 0; }
 .d-bar { flex: 1; height: 6px; background: #0c1730; border-radius: 3px; overflow: hidden; }
 .d-bar i { display: block; height: 100%; background: linear-gradient(90deg, #4d8dff, #7e9ff5); border-radius: 3px; }
-.d-qty { width: 86px; text-align: right; color: #ffc107; flex-shrink: 0; font-size: 10px; }
+.d-qty { width: 108px; text-align: right; color: #ffc107; flex-shrink: 0; font-size: 10px; display: flex; flex-direction: column; align-items: flex-end; line-height: 1.35; }
+.d-qty em { font-style: normal; }
+.d-qty i { font-style: normal; color: #7ef0c9; font-size: 9px; }
+.d-qty i.short { color: #ffab91; }
 .placeholder {
   color: #5b6f94; font-size: 12px; text-align: center;
   border: 1px dashed rgba(120,160,220,0.2); border-radius: 10px; padding: 24px 12px;
@@ -267,9 +396,10 @@ watch(selectedEvent, (ev) => {
 .dispatch-item {
   position: relative;
   background: rgba(16,29,57,0.6); border: 1px solid rgba(120,160,220,0.12);
-  border-radius: 9px; padding: 9px 40px 9px 10px;
+  border-radius: 9px; padding: 9px 10px;
 }
 .dispatch-item.held { border-color: rgba(255,193,7,0.35); opacity: 0.75; }
+.dispatch-item.done { opacity: 0.7; border-color: rgba(76,175,80,0.25); }
 .di-head { display: flex; align-items: center; gap: 7px; }
 .di-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .di-head strong { color: #dbe4f3; font-size: 12px; }
@@ -278,21 +408,80 @@ watch(selectedEvent, (ev) => {
   background: rgba(120,160,220,0.15); color: #8ba2c8;
 }
 .di-src.plan { background: rgba(156,77,255,0.2); color: #ce93ff; }
+.di-src.replenish { background: rgba(255,152,0,0.18); color: #ffcc80; }
 .di-held {
   font-size: 9px; padding: 1px 5px; border-radius: 4px;
   background: rgba(255,193,7,0.18); color: #ffd54f;
 }
+.di-done {
+  font-size: 9px; padding: 1px 5px; border-radius: 4px;
+  background: rgba(76,175,80,0.18); color: #a5d6a7;
+}
+.di-done.short { background: rgba(255,152,0,0.18); color: #ffcc80; }
+.di-done.returned { background: rgba(120,160,220,0.15); color: #8ba2c8; }
 .di-detour {
   font-size: 9px; padding: 1px 5px; border-radius: 4px;
   background: rgba(255,152,0,0.15); color: #ffcc80;
 }
-.di-qty { margin-left: auto; color: #ffc107; font-size: 12px; font-weight: 700; }
+.di-qty { margin-left: auto; color: #ffc107; font-size: 12px; font-weight: 700; display: flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+.di-qty em { font-style: normal; }
+.di-qty i { font-style: normal; font-size: 9px; color: #7ea8e8; font-weight: 400; }
+.di-qty i.short { color: #ffab91; }
 .di-sub { font-size: 10px; color: #8ba2c8; margin: 4px 0 0; }
 .di-meta { font-size: 10px; color: #5b6f94; margin: 2px 0 0; }
-.undo {
-  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
-  background: transparent; border: 1px solid rgba(239,83,80,0.4); color: #ef5350;
-  font-size: 11px; border-radius: 5px; padding: 3px 8px; cursor: pointer;
+
+/* 数量分账条 */
+.di-ledger {
+  display: flex; height: 5px; border-radius: 3px; overflow: hidden;
+  background: #0c1730; margin-top: 6px;
 }
-.undo:hover { background: rgba(239,83,80,0.15); }
+.di-ledger i { display: block; height: 100%; }
+.lg-transit { background: linear-gradient(90deg, #4d8dff, #7e9ff5); }
+.lg-recv { background: linear-gradient(90deg, #26a69a, #7ef0c9); }
+.lg-short { background: #ff9800; }
+.lg-ret { background: #6f8cb8; }
+.di-ledger-txt { font-size: 10px; color: #8ba2c8; margin: 4px 0 0; }
+.di-ledger-txt b { color: #dbe4f3; font-weight: 700; }
+.di-ledger-txt em { font-style: normal; color: #5b6f94; }
+
+/* 闭环操作 */
+.di-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.act {
+  background: #0c1730; border: 1px solid rgba(120,160,220,0.25);
+  color: #8ba2c8; font-size: 10px; border-radius: 5px; padding: 3px 8px; cursor: pointer;
+}
+.act:hover { color: #fff; border-color: #4d8dff; }
+.act.sign { border-color: rgba(38,166,154,0.45); color: #7ef0c9; }
+.act.sign:hover { background: rgba(38,166,154,0.15); }
+.act.ret { border-color: rgba(120,160,220,0.35); }
+.act.replenish { border-color: rgba(255,152,0,0.5); color: #ffcc80; }
+.act.replenish:hover { background: rgba(255,152,0,0.12); }
+.act.withdraw { border-color: rgba(239,83,80,0.4); color: #ef5350; margin-left: auto; }
+.act.withdraw:hover { background: rgba(239,83,80,0.12); }
+
+/* 行内迷你表单 */
+.mini-form {
+  margin-top: 7px; background: #0c1730; border: 1px solid rgba(120,160,220,0.18);
+  border-radius: 7px; padding: 8px;
+}
+.mf-hint { font-size: 10px; color: #8ba2c8; margin: 0 0 6px; }
+.mf-row { display: flex; gap: 5px; }
+.mf-row input {
+  flex: 1; min-width: 0; width: 0;
+  background: #101d39; border: 1px solid rgba(120,160,220,0.2);
+  color: #dbe4f3; border-radius: 5px; padding: 5px 7px; font-size: 11px; box-sizing: border-box;
+}
+.mf-btns { display: flex; gap: 6px; margin-top: 6px; }
+.mf-btns button {
+  padding: 4px 12px; font-size: 11px; border-radius: 5px; cursor: pointer;
+  background: transparent; border: 1px solid rgba(120,160,220,0.3); color: #8ba2c8;
+}
+.mf-btns button.ok { border-color: #26a69a; color: #7ef0c9; }
+.mf-btns button.ok:hover { background: rgba(38,166,154,0.15); }
+.mf-btns button.warn { border-color: #ff9800; color: #ffcc80; }
+.mf-btns button.warn:hover { background: rgba(255,152,0,0.12); }
+.di-fb { font-size: 10px; margin: 5px 0 0; }
+.di-fb.ok { color: #7ef0c9; }
+.di-fb.err { color: #ef9a9a; }
+.di-signlog { font-size: 9px; color: #5b6f94; margin: 4px 0 0; }
 </style>

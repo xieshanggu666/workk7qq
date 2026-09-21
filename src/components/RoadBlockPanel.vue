@@ -118,7 +118,7 @@
       <div class="panel-sub">⏸ 挂起任务（{{ roadblock.heldCount }}）</div>
       <div v-for="d in roadblock.heldDispatches" :key="d.id" class="held-item">
         <span class="h-kind">📦</span>
-        <span class="h-label">{{ d.typeLabel }} {{ d.qty }}{{ d.unit }}｜{{ d.baseName }} → {{ d.eventTitle || d.shelterName }}</span>
+        <span class="h-label">{{ d.typeLabel }} {{ heldQty(d) }}{{ d.unit }}｜{{ d.baseName }} → {{ d.eventTitle || d.shelterName }}</span>
       </div>
       <div v-for="b in roadblock.heldBatches" :key="b.id" class="held-item">
         <span class="h-kind">🚌</span>
@@ -132,7 +132,7 @@
 
 <script setup>
 import { ref, computed } from 'vue'
-import { useCommandStore } from '@/store/command'
+import { useCommandStore, dispatchParts } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
 import { useRoadblockStore } from '@/store/roadblock'
 
@@ -148,6 +148,7 @@ const selectedEvent = computed(() => cmd.events.find((e) => e.id === cmd.selecte
 const clearedCount = computed(() => roadblock.blocks.filter((b) => b.status === 'cleared').length)
 const countOf = (blk, kind) => blk.impacts.filter((i) => i.kind === kind).length
 const pendingCount = (blk) => blk.impacts.filter((i) => i.checked && !i.done && i.plan).length
+const heldQty = (d) => dispatchParts(d).heldQty
 const shelterName = (id) => transfer.shelters.find((s) => s.id === id)?.name || '—'
 
 const ACTION_ICON = { detour: '🔀', reassign: '🔁', suspend: '⏸' }

@@ -40,6 +40,14 @@
         <span class="num" style="color:#ffc107">{{ store.stats.dispatchedToday }}</span>
         <span class="lab">今日派发</span>
       </div>
+      <div class="stat">
+        <span class="num" style="color:#7ef0c9">{{ store.stats.signedToday }}</span>
+        <span class="lab">今日签收</span>
+      </div>
+      <div class="stat" :class="{ blocked: store.stats.shortagePending }">
+        <span class="num" style="color:#ff9800">{{ store.stats.shortagePending }}</span>
+        <span class="lab">短缺待补</span>
+      </div>
       <div class="stat" :class="{ blocked: roadblock.activeBlocks.length }">
         <span class="num" style="color:#ef5350">{{ roadblock.activeBlocks.length }}</span>
         <span class="lab">道路阻断</span>

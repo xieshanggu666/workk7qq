@@ -190,10 +190,11 @@ function renderHeatmap() {
   }
 }
 
-// 渲染派发路径线（资源库 → 受灾点，含绕行途经点；挂起任务置灰）
+// 渲染派发路径线（资源库 → 受灾点，含绕行途经点；挂起任务置灰；已办结路线撤除）
 function renderDispatches() {
   clearLines()
   store.dispatches.forEach((d) => {
+    if (d.status === 'done') return
     const base = store.bases.find((b) => b.id === d.baseId)
     if (!base) return
     const held = d.status === 'held'
